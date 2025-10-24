@@ -22,3 +22,5 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+config/api_key.py

@@ -1,0 +1,1 @@
+# Logic for the desktop application (e.g. with Tkinter, PyQt)

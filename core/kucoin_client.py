@@ -1,0 +1,1 @@
+# Module to interact with the KuCoin API
