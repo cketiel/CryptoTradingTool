@@ -1,0 +1,24 @@
+# Entorno Virtual de Python
+.venv/
+venv/
+ENV/
+
+# Archivos compilados de Python y caché
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Archivos de configuración de Visual Studio
+.vs/
+*.suo
+*.user
+
+# Archivos de configuración de IDEs populares
+.idea/
+.vscode/
+
+# Otros
+*.egg-info/
+dist/
+build/
