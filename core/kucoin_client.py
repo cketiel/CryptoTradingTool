@@ -1,176 +1,191 @@
-# Module to interact with the KuCoin API
-
 import ccxt
 import sys
+import os
+import requests
+import time
+import pickle
 from datetime import datetime, timezone, timedelta
 
-# Import credentials from our secure config file
 try:
     from config.api_key import API_KEY, API_SECRET, API_PASSWORD
 except ImportError:
-    print("Error: 'config/api_key.py' not found or is missing the required variables.")
-    print("Please create the file and define API_KEY, API_SECRET, and API_PASSWORD.")
-    sys.exit(1) # Exit the script if credentials are not found
+    print("Error: 'config/api_key.py' not found or is missing required variables.")
+    sys.exit(1)
+
+ASSET_CACHE_DIR = 'cache'
+ICON_CACHE_DIR = os.path.join(ASSET_CACHE_DIR, 'icons')
+ASSET_DETAILS_FILE = os.path.join(ASSET_CACHE_DIR, 'asset_details.pkl')
+COINGECKO_MAP_FILE = os.path.join(ASSET_CACHE_DIR, 'coingecko_map.pkl')
 
 class KuCoinClient:
-    """
-    A class to interact with the KuCoin Futures API.
-    It encapsulates the ccxt exchange instance.
-    """
-
     def __init__(self):
-        """
-        Initializes the KuCoin client and handles authentication.
-        """
         self.client = None
-        # Validate that the keys are not empty or still have placeholder text
+        self.asset_details = self._load_local_asset_cache()
+        self.coingecko_map = {}
         if not all([API_KEY, API_SECRET, API_PASSWORD]) or "HERE" in API_KEY:
-            print("Error: Credentials in 'config/api_key.py' are incomplete.")
-            sys.exit(1)
-        
+            sys.exit("Error: Credentials in 'config/api_key.py' are incomplete.")
         try:
-            # Setup for KuCoin Futures API
             self.client = ccxt.kucoinfutures({
-                'apiKey': API_KEY,
-                'secret': API_SECRET,
-                'password': API_PASSWORD,               
+                'apiKey': API_KEY, 'secret': API_SECRET, 'password': API_PASSWORD,
             })
-            # Test the connection to verify credentials
-            #self.client.fetch_balance()
             print("Successfully connected to the KuCoin Futures API.")
-        except ccxt.AuthenticationError as e:
-            print(f"KuCoin Authentication Error: {e}")
-            print("Please check your credentials in 'config/api_key.py'.")
-            sys.exit(1)
         except Exception as e:
-            print(f"An error occurred while connecting to KuCoin: {e}")
-            sys.exit(1)
+            sys.exit(f"An error occurred during KuCoin client initialization: {e}")
 
-    def fetch_top_volumes(self, limit=70):
-        """
-        Fetches the future pairs with the highest 24h volume.
+    def _load_local_asset_cache(self):
+        if os.path.exists(ASSET_DETAILS_FILE):
+            try:
+                with open(ASSET_DETAILS_FILE, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                print(f"Warning: Could not load asset cache: {e}.")
+        return {}
 
-        Args:
-            limit (int): The number of pairs to retrieve. Defaults to 70.
-
-        Returns:
-            list: A list of symbols for the highest volume pairs (e.g., ['BTC/USDT:USDT']).
-        """
-        if not self.client:
-            print("Client is not initialized. Cannot fetch data.")
-            return []
-
+    def get_asset_details(self, symbol_string):
         try:
-            # Fetch tickers for all futures markets
+            base_currency = symbol_string.split('/')[0]
+            return self.asset_details.get(base_currency, {'name': base_currency, 'icon_path': None})
+        except Exception:
+            return {'name': symbol_string, 'icon_path': None}
+    
+    def ensure_asset_details_are_loaded(self, top_symbols: list, log_callback=None):
+        def _log(message):
+            if log_callback: log_callback(message)
+        base_currencies_to_check = {s.split('/')[0] for s in top_symbols}
+        missing_currencies = [
+            c for c in base_currencies_to_check 
+            if not self.asset_details.get(c) or not self.asset_details[c].get('icon_path') or not os.path.exists(self.asset_details[c]['icon_path'])
+        ]
+        if not missing_currencies:
+            return
+        _log(f"Found {len(missing_currencies)} new or missing assets. Fetching details...")
+        if not self.coingecko_map:
+            if os.path.exists(COINGECKO_MAP_FILE):
+                with open(COINGECKO_MAP_FILE, 'rb') as f:
+                    self.coingecko_map = pickle.load(f)
+            else:
+                _log("Fetching CoinGecko ID map (one-time operation)...")
+                try:
+                    os.makedirs(ASSET_CACHE_DIR, exist_ok=True)
+                    response = requests.get("https://api.coingecko.com/api/v3/coins/list", timeout=30)
+                    response.raise_for_status()
+                    for coin in response.json():
+                        self.coingecko_map[coin['symbol']] = coin['id']
+                    with open(COINGECKO_MAP_FILE, 'wb') as f:
+                        pickle.dump(self.coingecko_map, f)
+                except Exception as e:
+                    _log(f"Fatal Error: Could not fetch CoinGecko ID map: {e}")
+                    return
+        os.makedirs(ICON_CACHE_DIR, exist_ok=True)
+        for i, code in enumerate(missing_currencies):
+            _log(f"  -> Fetching Icon & Name [{i+1}/{len(missing_currencies)}]: {code}")
+            coingecko_id = self.coingecko_map.get(code.lower())
+            if not coingecko_id:
+                self.asset_details[code] = {'name': code, 'icon_path': None}
+                continue
+            max_retries = 3
+            success = False
+            for attempt in range(max_retries):
+                try:
+                    time.sleep(1.2)
+                    coin_url = f"https://api.coingecko.com/api/v3/coins/{coingecko_id}"
+                    coin_response = requests.get(coin_url, timeout=10)
+                    if coin_response.status_code == 429:
+                        _log(f"    Rate limit hit for {code}. Waiting 61 seconds...")
+                        time.sleep(61)
+                        continue
+                    coin_response.raise_for_status()
+                    coin_data = coin_response.json()
+                    name = coin_data.get('name', code)
+                    icon_url = coin_data.get('image', {}).get('small')
+                    icon_path = None
+                    if icon_url:
+                        icon_response = requests.get(icon_url, stream=True, timeout=10)
+                        icon_response.raise_for_status()
+                        filename = f"{code}.png"
+                        icon_path = os.path.join(ICON_CACHE_DIR, filename)
+                        with open(icon_path, 'wb') as f:
+                            for chunk in icon_response.iter_content(chunk_size=8192): f.write(chunk)
+                    self.asset_details[code] = {'name': name, 'icon_path': icon_path}
+                    success = True
+                    break
+                except requests.exceptions.RequestException as e:
+                    _log(f"    Attempt {attempt+1}/{max_retries} failed for {code}: {e}. Retrying...")
+                    time.sleep(5 * (attempt + 1))
+            if not success:
+                _log(f"    All attempts failed for {code}. Using fallback data.")
+                self.asset_details[code] = {'name': code, 'icon_path': None}
+        with open(ASSET_DETAILS_FILE, 'wb') as f:
+            pickle.dump(self.asset_details, f)
+        _log("Asset details cache has been updated.")
+
+    def fetch_top_volumes(self, limit=50):
+        try:
             tickers = self.client.fetch_tickers()
-
-            # Filter for USDT-margined markets only and sort by quote volume
-            symbols_with_volume = [
-                (symbol, data['quoteVolume']) for symbol, data in tickers.items()
-                if data.get('quoteVolume') is not None and ':USDT' in symbol
-            ]
-            
-            # Sort from highest to lowest volume and apply the limit
-            top_symbols = sorted(symbols_with_volume, key=lambda x: x[1], reverse=True)[:limit]
-
-            print(f"Found {len(top_symbols)} high-volume pairs.")
-            return [symbol[0] for symbol in top_symbols]
-
+            symbols = [(s, d['quoteVolume']) for s, d in tickers.items() if d.get('quoteVolume') and ':USDT' in s]
+            return [s[0] for s in sorted(symbols, key=lambda x: x[1], reverse=True)[:limit]]
         except Exception as e:
             print(f"Error fetching tickers from KuCoin: {e}")
             return []
 
     def count_consecutive_candles(self, symbol, timeframe, num_candles=20):
-        """
-        Counts the number of consecutive green or red candles for a given symbol.
-
-        Args:
-            symbol (str): The trading symbol (e.g., 'BTC/USDT:USDT').
-            timeframe (str): The timeframe to analyze (e.g., '1h', '4h').
-            num_candles (int): The number of recent candles to fetch for analysis.
-
-        Returns:
-            int: The number of consecutive candles of the same color from the most recent completed candle.
-                 Returns 0 if an error occurs.
-        """
-        if not self.client:
-            print("Client is not initialized. Cannot fetch candle data.")
-            return 0
-        
+        """Counts consecutive candles and returns count, color, and last close price."""
         try:
-            # Calculate the starting time to fetch the last `num_candles`
-            timeframe_in_ms = self.client.parse_timeframe(timeframe) * 1000
-            since = self.client.milliseconds() - (num_candles * timeframe_in_ms)
-
-            # Fetch the OHLCV data
+            since = self.client.milliseconds() - (num_candles * self.client.parse_timeframe(timeframe) * 1000)
             ohlcv = self.client.fetch_ohlcv(symbol, timeframe, since=since, limit=num_candles)
+            if not ohlcv: 
+                return 0, None, None
+            
+            completed = ohlcv[:-1]
+            if not completed:
+                return 0, None, None
 
-            if not ohlcv:
-                print(f"Warning: No OHLCV data returned for {symbol} on {timeframe}.")
-                return 0
-
-            # Exclude the current, incomplete candle from the analysis
-            completed_candles = ohlcv[:-1]
-
-            # Count consecutive candles of the same color, starting from the most recent
-            consecutive_count = 0
+            count = 0
             last_color = None
+            last_close_price = None
+          
+            for i, candle in enumerate(reversed(completed)):
+                # candle format: [timestamp, open, high, low, close, volume]
+                if i == 0:
+                    last_close_price = candle[4] 
 
-            for candle in reversed(completed_candles):
-                # ohlcv format: [timestamp, open, high, low, close, volume]
-                open_price = candle[1]
-                close_price = candle[4]
-                
-                current_color = "green" if close_price >= open_price else "red"
-
-                if last_color is None or current_color == last_color:
-                    consecutive_count += 1
-                    last_color = current_color
-                else:
-                    # The streak is broken
+                color = "green" if candle[4] >= candle[1] else "red"
+                if last_color is None or color == last_color:
+                    count += 1
+                    last_color = color
+                else: 
                     break
             
-            return consecutive_count
-
-        except Exception as e:
-            print(f"Error counting candles for {symbol} on {timeframe}: {e}")
-            return 0
-
-    def scan_for_candle_streaks(self, timeframes, top_n_volume=70, min_streak_count=3):
-        """
-        Scans top volume assets across multiple timeframes for consecutive candle streaks.
-
-        Args:
-            timeframes (list): A list of timeframes to scan (e.g., ['1h', '4h']).
-            top_n_volume (int): The number of top volume symbols to scan.
-            min_streak_count (int): The minimum number of consecutive candles to be considered a valid streak.
-
-        Returns:
-            list: A sorted list of tuples, where each tuple is (symbol, streak_count, timeframe).
-                  The list is sorted by streak_count in descending order.
-        """
-        print(f"Scanning {top_n_volume} top volume symbols for streaks of at least {min_streak_count} candles...")
-        
-        # 1. Get the symbols with the highest volume
+            return count, last_color, last_close_price
+        except Exception: 
+            return 0, None, None
+            
+    def scan_for_candle_streaks(self, timeframes, top_n_volume=50, min_streak_count=3, progress_callback=None, log_callback=None):
+        """Scans top volume assets for streaks and ensures their metadata is loaded."""
+        def _log(message):
+            if log_callback: log_callback(message)
+        _log("Fetching top volume symbols from KuCoin...")
         symbols = self.fetch_top_volumes(limit=top_n_volume)
         if not symbols:
-            print("Could not fetch top volume symbols. Aborting scan.")
+            _log("Could not fetch top volume symbols. Aborting scan.")
             return []
-
-        # 2. Iterate through symbols and timeframes to find streaks
+        self.ensure_asset_details_are_loaded(symbols, log_callback)
+        _log(f"Scanning {len(symbols)} symbols for candle streaks...")
         report_data = []
+        total_scans = len(symbols) * len(timeframes)
+        current_scan = 0
         for i, symbol in enumerate(symbols):
-            # Print progress to the console
             print(f"  -> [{i+1}/{len(symbols)}] Analyzing {symbol}...")
+            _log(f"  -> [{i+1}/{len(symbols)}] Analyzing {symbol}...")
             for timeframe in timeframes:
-                count = self.count_consecutive_candles(symbol, timeframe)
+                current_scan += 1
+                if progress_callback: progress_callback(current_scan, total_scans)
                 
-                # Only add to the report if the streak is significant
-                if count >= min_streak_count:
-                    report_data.append((symbol, count, timeframe))
-
-        # 3. Sort the final data by the streak count (descending)
-        sorted_data = sorted(report_data, key=lambda x: x[1], reverse=True)
+                count, color, last_price = self.count_consecutive_candles(symbol, timeframe)
+                
+                if count >= min_streak_count:                   
+                    report_data.append((symbol, count, timeframe, color, last_price))
         
-        print(f"Scan complete. Found {len(sorted_data)} significant streaks.")
-        return sorted_data
+        if progress_callback: progress_callback(total_scans, total_scans)
+        _log("Scan complete.")
+        return report_data
