@@ -3,11 +3,12 @@ import time
 import os
 import pickle
 from datetime import datetime, timedelta
+import webbrowser
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QTableView, QPushButton, QLabel, QHeaderView, QRadioButton,
                                QGroupBox, QLineEdit, QStyledItemDelegate, QStyle, QDialog,
-                               QTextEdit, QProgressBar)
+                               QTextEdit, QProgressBar, QMessageBox)
 from PySide6.QtCore import (Qt, QAbstractTableModel, QTimer, QThread, Signal,
                             QObject, QSortFilterProxyModel, QSize, QRect)
 from PySide6.QtGui import QColor, QFont, QPixmap, QPainter, QPalette, QPainterPath
@@ -230,6 +231,7 @@ class MainWindow(QMainWindow):
         self.search_bar.textChanged.connect(self.proxy_model.setFilterFixedString)
         self.refresh_button.clicked.connect(self.manual_refresh)
         self.log_button.clicked.connect(self.log_dialog.show)
+        self.table_view.clicked.connect(self.on_row_clicked)
     def setup_table_style(self):
         self.table_view.setSortingEnabled(True); self.table_view.sortByColumn(4, Qt.SortOrder.DescendingOrder); self.table_view.setAlternatingRowColors(True)
         header = self.table_view.horizontalHeader()
@@ -242,6 +244,47 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         self.table_view.verticalHeader().setVisible(False); self.table_view.verticalHeader().setDefaultSectionSize(36)
         bold_font = QFont(); bold_font.setBold(True); header.setFont(bold_font)
+
+    def on_row_clicked(self, index):
+        """Slot que se activa al hacer clic en una fila de la tabla."""
+        # Mapear el índice del proxy model (visible) al del source model (datos reales)
+        source_index = self.proxy_model.mapToSource(index)
+        row = source_index.row()
+
+        # Obtener el símbolo de la columna 3 del modelo de datos
+        symbol_index = self.source_model.index(row, 3)       
+        symbol_text = self.source_model.data(symbol_index, Qt.ItemDataRole.DisplayRole)
+
+        if not symbol_text:
+            return
+
+        # Crear y mostrar el diálogo de confirmación
+        reply = QMessageBox.question(self, 
+            "Confirmar Trade",
+            f"¿Deseas abrir la página de trading en KuCoin para {symbol_text}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+
+        # Si el usuario hace clic en "Sí"
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                # Transformar el símbolo: EVAA/USDT:USDT -> EVAAUSDTM
+                base_symbol = symbol_text.split(':')[0]
+                formatted_symbol = base_symbol.replace('/', '')
+                url_symbol = f"{formatted_symbol}M"
+                
+                # Construir la URL completa
+                url = f"https://www.kucoin.com/trade/futures/{url_symbol}"
+                
+                log_message(f"Abriendo navegador en la URL: {url}")
+                webbrowser.open(url) # Abrir la URL en el navegador por defecto
+            except Exception as e:
+                log_message(f"Error al construir la URL para '{symbol_text}': {e}")
+                # Opcional: Mostrar un mensaje de error al usuario
+                QMessageBox.critical(self, "Error", "No se pudo generar la URL de trading.")
+        else:
+            log_message("Acción de trade cancelada por el usuario.")
+
     def check_sync_point(self):
         now = datetime.now()
         log_message(f"check_sync_point() called by timer at {now.strftime('%H:%M:%S')}.")
